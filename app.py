@@ -40,3 +40,4 @@ def ask_groq(text: str) -> dict:
         "reply": str(result.get("reply", "")),
         "emotion": str(result.get("emotion", "normal"))
     }
+  
