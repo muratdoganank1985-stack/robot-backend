@@ -2,56 +2,101 @@ import os
 import json
 import asyncio
 import tempfile
+from io import BytesIO
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from groq import Groq
 import edge_tts
+from pydub import AudioSegment
 
-# Render'ın dinamik PORT ayarı
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 5000))
-
-# Groq API Key ayarı
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-client = Groq(api_key=GROQ_API_KEY)
 
-SYSTEM_PROMPT = """Sen ev robotunun yapay zeka beynisin.
-Kullanıcıyla Türkçe, kısa ve doğal konuş.
-Matematik sorularını doğru ve adım adım mantığıyla kısa şekilde açıkla.
-Genel kültür sorularına net cevaplar ver, sohbet edildiğinde dostça karşılık ver.
-Çocukların anlayabileceği sade bir dil kullan.
-Her cevabın yanında robotun yüzü için tek bir duygu seç.
-Sadece şu JSON'u döndür:
-{
-  "reply": "kısa Türkçe cevap",
-  "emotion": "normal|happy|sad|angry|surprised|thinking|sleepy|scared|love"
-}
-Başka alan ekleme."""
+def process_voice_input(wav_bytes: bytes) -> dict:
+    if not GROQ_API_KEY:
+        print("[HATA]: GROQ_API_KEY bulunamadi!")
+        return {
+            "text": "API Key Yok",
+            "reply": "Render panelinde GROQ API anahtari eksik kanka!",
+            "emotion": "angry"
+        }
 
-def ask_groq(text: str) -> dict:
-    completion = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": text}
-        ],
-        response_format={"type": "json_object"}
-    )
-    result = json.loads(completion.choices[0].message.content)
-    return {
-        "reply": str(result.get("reply", "")),
-        "emotion": str(result.get("emotion", "normal"))
-    }
+    try:
+        from groq import Groq
+        client = Groq(api_key=GROQ_API_KEY)
 
-async def generate_speech_bytes(text: str) -> bytes:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp.write(wav_bytes)
+            tmp_path = tmp.name
+
+        try:
+            with open(tmp_path, "rb") as file:
+                transcription = client.audio.transcriptions.create(
+                    file=(os.path.basename(tmp_path), file.read()),
+                    model="whisper-large-v3-turbo",
+                    language="tr"
+                )
+            user_text = transcription.text
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        print(f"[STT ALINDI]: {user_text}")
+
+        if not user_text or not user_text.strip():
+            return {
+                "text": "(Ses Algilanmadi)",
+                "reply": "Seni duyamadim kanka, tekrar soyler misin?",
+                "emotion": "surprised"
+            }
+
+        SYSTEM_PROMPT = """Sen sevimli bir ev robotusun.
+Kullaniciyla Turkce, kisa ve samimi konus.
+Cevabina uygun tek bir duygu sec.
+Sadece su JSON formatinda cevap ver:
+{"reply": "kisa cevap", "emotion": "normal|happy|sad|angry|surprised|thinking|sleepy|scared|love"}"""
+
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_text}
+            ],
+            response_format={"type": "json_object"}
+        )
+        
+        raw_res = completion.choices[0].message.content
+        result = json.loads(raw_res)
+        return {
+            "text": user_text,
+            "reply": str(result.get("reply", "Anlamadim kanka.")),
+            "emotion": str(result.get("emotion", "normal"))
+        }
+
+    except Exception as e:
+        print(f"[PROCESS ERROR]: {e}")
+        return {
+            "text": "Sunucu Hatasi",
+            "reply": "Hata olustu kanka.",
+            "emotion": "sad"
+        }
+
+async def generate_wav_bytes(text: str) -> bytes:
     communicate = edge_tts.Communicate(text, "tr-TR-AhmetNeural")
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-        tmp_path = tmp.name
-    await communicate.save(tmp_path)
-    with open(tmp_path, "rb") as f:
-        data = f.read()
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
-    return data
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_mp3:
+        mp3_path = tmp_mp3.name
+
+    await communicate.save(mp3_path)
+
+    try:
+        audio = AudioSegment.from_file(mp3_path, format="mp3")
+        audio = audio.set_frame_rate(22050).set_channels(1).set_sample_width(2)
+
+        wav_io = BytesIO()
+        audio.export(wav_io, format="wav")
+        return wav_io.getvalue()
+    finally:
+        if os.path.exists(mp3_path):
+            os.remove(mp3_path)
 
 class RequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -62,36 +107,40 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length).decode("utf-8")
-        
-        try:
-            req_data = json.loads(body)
-            user_text = req_data.get("text", "")
-            
-            # 1. Groq'tan yanıt ve duygu al
-            ai_res = ask_groq(user_text)
-            reply_text = ai_res["reply"]
-            emotion = ai_res["emotion"]
-            
-            # 2. Edge-TTS ile ses üret
-            audio_bytes = asyncio.run(generate_speech_bytes(reply_text))
-            
-            # 3. Yanıtı gönder
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("X-Robot-Emotion", emotion)
-            self.send_header("X-Robot-Reply", reply_text.encode("utf-8").decode("latin-1", "ignore"))
-            self.end_headers()
-            self.wfile.write(audio_bytes)
+        body_bytes = self.rfile.read(content_length)
 
-        except Exception as e:
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json")
+        if self.path == "/voice":
+            # Ham WAV verisi işleniyor (decode edilmiyor!)
+            res_data = process_voice_input(body_bytes)
+            res_json = json.dumps(res_data, ensure_ascii=False)
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(res_json.encode("utf-8"))))
             self.end_headers()
-            err_msg = json.dumps({"error": str(e)})
-            self.wfile.write(err_msg.encode("utf-8"))
+            self.wfile.write(res_json.encode("utf-8"))
+
+        elif self.path == "/tts":
+            try:
+                # Sadece /tts isteği JSON string içerdiği için decode ediliyor
+                req_data = json.loads(body_bytes.decode("utf-8"))
+                reply_text = req_data.get("text", "Merhaba")
+                wav_bytes = asyncio.run(generate_wav_bytes(reply_text))
+
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/wav")
+                self.send_header("Content-Length", str(len(wav_bytes)))
+                self.end_headers()
+                self.wfile.write(wav_bytes)
+            except Exception as e:
+                print(f"[TTS ERROR]: {e}")
+                self.send_response(500)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
 
 if __name__ == "__main__":
     server = ThreadingHTTPServer((HOST, PORT), RequestHandler)
-    print(f"Server started at http://{HOST}:{PORT}")
+    print(f"Sunucu aktif: port {PORT}")
     server.serve_forever()
