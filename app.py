@@ -99,6 +99,9 @@ async def generate_wav_bytes(text: str) -> bytes:
             os.remove(mp3_path)
 
 class RequestHandler(BaseHTTPRequestHandler):
+    # HTTP/1.1 chunked aktarım belasını engellemek için HTTP/1.0 zorluyoruz
+    protocol_version = "HTTP/1.0"
+
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -110,19 +113,18 @@ class RequestHandler(BaseHTTPRequestHandler):
         body_bytes = self.rfile.read(content_length)
 
         if self.path == "/voice":
-            # Ham WAV verisi işleniyor (decode edilmiyor!)
             res_data = process_voice_input(body_bytes)
             res_json = json.dumps(res_data, ensure_ascii=False)
+            response_bytes = res_json.encode("utf-8")
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(res_json.encode("utf-8"))))
+            self.send_header("Content-Length", str(len(response_bytes)))
             self.end_headers()
-            self.wfile.write(res_json.encode("utf-8"))
+            self.wfile.write(response_bytes)
 
         elif self.path == "/tts":
             try:
-                # Sadece /tts isteği JSON string içerdiği için decode ediliyor
                 req_data = json.loads(body_bytes.decode("utf-8"))
                 reply_text = req_data.get("text", "Merhaba")
                 wav_bytes = asyncio.run(generate_wav_bytes(reply_text))
