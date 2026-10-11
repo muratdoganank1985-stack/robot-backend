@@ -56,7 +56,7 @@ Sadece su JSON formatinda cevap ver:
 {"reply": "kisa cevap", "emotion": "normal|happy|sad|angry|surprised|thinking|sleepy|scared|love"}"""
 
         completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_text}
